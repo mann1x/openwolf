@@ -8,7 +8,7 @@ import { readJSON, writeJSON, readText, writeText } from "../utils/fs-safe.js";
 import { ensureDir } from "../utils/paths.js";
 import { isWindows } from "../utils/platform.js";
 import { buildHookCommand } from "../utils/hook-command.js";
-import { registerProject } from "./registry.js";
+import { registerProject, getRegisteredProjects } from "./registry.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -24,10 +24,14 @@ function getVersion(): string {
   }
 }
 
-// Files that are safe to overwrite on upgrade (config/protocol, not user data)
+// Files that are safe to overwrite on upgrade (protocol docs only, not user data).
+// NOTE: config.json is deliberately NOT here. It holds per-project port
+// assignments (openwolf.daemon.port / openwolf.dashboard.port) and other
+// user tunables; overwriting it on re-init resets every project to the same
+// default ports (18790 / 18791), so only the first daemon to start can bind
+// and the rest crash-loop on EADDRINUSE. It is handled by reconcileConfig().
 const ALWAYS_OVERWRITE = [
   "OPENWOLF.md",
-  "config.json",
   "reframe-frameworks.md",
 ];
 
@@ -135,6 +139,15 @@ export async function initCommand(): Promise<void> {
       writeTemplateFile(actualTemplatesDir, wolfDir, file);
       createdCount++;
     }
+  }
+
+  // config.json: create-if-missing, and on a fresh create allocate a port
+  // pair that no other registered project is using. Existing configs keep
+  // their ports untouched so a re-init never resets them.
+  if (reconcileConfig(actualTemplatesDir, wolfDir, projectRoot)) {
+    createdCount++;
+  } else {
+    skippedCount++;
   }
 
   // --- Cerebrum: seed project info only if fresh ---
@@ -284,6 +297,60 @@ function writeTemplateFile(templatesDir: string, wolfDir: string, file: string):
   } else {
     generateTemplate(destPath, file);
   }
+}
+
+// Default daemon/dashboard ports. A fresh project is allocated the next free
+// pair so multiple projects' daemons never collide on the same port.
+const DEFAULT_DAEMON_PORT = 18790;
+const DEFAULT_DASHBOARD_PORT = 18791;
+
+function normalizeRoot(p: string): string {
+  const resolved = path.resolve(p);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+// Ports already claimed by OTHER registered projects' config.json files.
+function collectUsedPorts(excludeRoot: string): Set<number> {
+  const used = new Set<number>();
+  const exclude = normalizeRoot(excludeRoot);
+  for (const proj of getRegisteredProjects(false)) {
+    if (normalizeRoot(proj.root) === exclude) continue;
+    const cfg = readJSON<any>(path.join(proj.root, ".wolf", "config.json"), null as any);
+    const ow = cfg && cfg.openwolf;
+    if (ow) {
+      if (ow.daemon && typeof ow.daemon.port === "number") used.add(ow.daemon.port);
+      if (ow.dashboard && typeof ow.dashboard.port === "number") used.add(ow.dashboard.port);
+    }
+  }
+  return used;
+}
+
+// config.json is user data: created from template only when absent, and on
+// that fresh create it is stamped with a port pair no other registered
+// project uses. An existing config is left completely untouched so a re-init
+// never resets its ports. Returns true if a new file was written.
+function reconcileConfig(templatesDir: string, wolfDir: string, projectRoot: string): boolean {
+  const cfgPath = path.join(wolfDir, "config.json");
+  if (fs.existsSync(cfgPath)) {
+    return false; // preserve existing ports + user tunables
+  }
+  writeTemplateFile(templatesDir, wolfDir, "config.json");
+  const cfg = readJSON<any>(cfgPath, null as any);
+  if (cfg && cfg.openwolf && cfg.openwolf.dashboard) {
+    const used = collectUsedPorts(projectRoot);
+    const nextFree = (base: number): number => {
+      let p = base;
+      while (used.has(p)) p++;
+      used.add(p);
+      return p;
+    };
+    cfg.openwolf.daemon = cfg.openwolf.daemon || {};
+    cfg.openwolf.dashboard = cfg.openwolf.dashboard || {};
+    cfg.openwolf.daemon.port = nextFree(DEFAULT_DAEMON_PORT);
+    cfg.openwolf.dashboard.port = nextFree(DEFAULT_DASHBOARD_PORT);
+    writeJSON(cfgPath, cfg);
+  }
+  return true;
 }
 
 function readTemplateContent(filename: string, templatesDir: string): string {

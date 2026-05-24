@@ -28,11 +28,21 @@ function getVersion(): string {
   }
 }
 
-// Files that are safe to overwrite (protocol/config)
-const ALWAYS_OVERWRITE = ["OPENWOLF.md", "config.json", "reframe-frameworks.md"];
+// Files that are safe to overwrite (protocol docs only — never user-edited config)
+const ALWAYS_OVERWRITE = ["OPENWOLF.md", "reframe-frameworks.md"];
 
-// Files that contain user data — NEVER overwrite, only create if missing
+// Files that contain user data — NEVER overwrite, only create if missing.
+//
+// `config.json` is user data: it holds per-project port assignments
+// (`openwolf.daemon.port`, `openwolf.dashboard.port`), scan intervals,
+// exclude patterns, and any other tunables a user has customized.
+// Overwriting it on `openwolf update` resets every registered project to
+// the same default ports (18790 / 18791), at which point only the first
+// daemon to start can bind and the rest crash-loop on EADDRINUSE.
+// Keep it in BACKUP_FILES (via the spread below) so `openwolf restore`
+// can still recover it.
 const USER_DATA_FILES = [
+  "config.json",
   "identity.md", "cerebrum.md", "memory.md", "anatomy.md",
   "token-ledger.json", "buglog.json", "cron-manifest.json", "cron-state.json",
   "suggestions.json", "designqc-report.json",
