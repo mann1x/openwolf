@@ -230,6 +230,25 @@ class NoConsoleParent {
 }
 '@ | Set-Content -Path $parentCs -Encoding ASCII
 
+# Launching the GUI-subsystem parent from pwsh is not enough to make it
+# console-LESS: a windows-subsystem child of a console process still inherits
+# that console, so its own child would inherit it too and never allocate a
+# new one. WSH is genuinely console-free — it allocates no console for a GUI
+# binary — so it is used purely to start the parent detached from ours. Style
+# 0 keeps wscript itself from contributing a window to the count.
+$hiddenRunner = Join-Path $work 'hidden-runner.vbs'
+@'
+Dim cmd, i
+cmd = ""
+For i = 0 To WScript.Arguments.Count - 1
+  If i > 0 Then cmd = cmd & " "
+  cmd = cmd & """" & WScript.Arguments(i) & """"
+Next
+Dim sh
+Set sh = CreateObject("WScript.Shell")
+WScript.Quit(sh.Run(cmd, 0, True))
+'@ | Set-Content -Path $hiddenRunner -Encoding ASCII
+
 $launcherExe = Join-Path $work 'HookLauncher.exe'
 $parentExe   = Join-Path $work 'NoConsoleParent.exe'
 foreach ($pair in @(@($launcherCs, $launcherExe), @($parentCs, $parentExe))) {
@@ -253,25 +272,40 @@ $results = New-Object System.Collections.Generic.List[object]
 function Measure-Shape {
   param(
     [string]$Name, [string]$What, [string]$Exe, [string[]]$ArgList,
-    [bool]$Redirect, [string]$Marker, [string]$ResultFile
+    [bool]$Redirect, [string]$Marker, [string]$ResultFile,
+    # 'inherit'      — ProcessStartInfo/UseShellExecute=false. The child
+    #                  inherits THIS process's console, so it can never raise
+    #                  a new window. Right for every shape under test.
+    # 'startprocess' — Start-Process, i.e. UseShellExecute=true, which gives
+    #                  the child its OWN console and therefore a window.
+    #                  Required for the phase 0 control: rebuilt on 'inherit'
+    #                  it showed 0 windows in a session already proven able to
+    #                  show them (pandorum, session 1), so the guard tripped
+    #                  and nothing was measured. A control that cannot
+    #                  succeed is as useless as one that cannot fail.
+    [ValidateSet('inherit','startprocess')] [string]$Spawn = 'inherit'
   )
   $baseline = Get-VisibleConsoles
   $seen = New-Object System.Collections.Generic.HashSet[string]
   $stdout = ''; $exit = $null
 
-  $psi = New-Object System.Diagnostics.ProcessStartInfo
-  $psi.FileName = $Exe
-  $psi.Arguments = ($ArgList | ForEach-Object {
-    if ($_ -match '^(//|[-/])') { $_ } else { '"' + $_ + '"' } }) -join ' '
-  $psi.UseShellExecute = $false
-  $psi.CreateNoWindow = $false
-  if ($Redirect) {
-    $psi.RedirectStandardInput = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
+  if ($Spawn -eq 'startprocess') {
+    $proc = Start-Process -FilePath $Exe -ArgumentList $ArgList -PassThru
+  } else {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Exe
+    $psi.Arguments = ($ArgList | ForEach-Object {
+      if ($_ -match '^(//|[-/])') { $_ } else { '"' + $_ + '"' } }) -join ' '
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $false
+    if ($Redirect) {
+      $psi.RedirectStandardInput = $true
+      $psi.RedirectStandardOutput = $true
+      $psi.RedirectStandardError = $true
+    }
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    if ($Redirect) { $proc.StandardInput.Write($payload); $proc.StandardInput.Close() }
   }
-  $proc = [System.Diagnostics.Process]::Start($psi)
-  if ($Redirect) { $proc.StandardInput.Write($payload); $proc.StandardInput.Close() }
 
   $deadline = (Get-Date).AddSeconds(25)
   while (-not $proc.HasExited -and (Get-Date) -lt $deadline) {
@@ -281,7 +315,7 @@ function Measure-Shape {
   $timedOut = -not $proc.HasExited
   if ($timedOut) { try { $proc.Kill() } catch {} }
   [void]$proc.WaitForExit(5000)
-  if ($Redirect) { $stdout = ($proc.StandardOutput.ReadToEnd() -replace '\s+$','') }
+  if ($Redirect -and $Spawn -eq 'inherit') { $stdout = ($proc.StandardOutput.ReadToEnd() -replace '\s+$','') }
   try { $exit = $proc.ExitCode } catch { $exit = $null }
 
   # A no-console parent reports through a file; fold that in so every row
@@ -302,9 +336,9 @@ function Measure-Shape {
 }
 
 Write-Host "-- phase 0: can this session show a console window at all? --"
-$sanity = Measure-Shape -Name 'new-console' -What 'a process given its own console' `
+$sanity = Measure-Shape -Name 'new-console' -What 'a process given its OWN console (Start-Process)' `
   -Exe $node -ArgList @($hookJs, (Join-Path $work 'm0.txt'), 'nostdin') -Redirect $false `
-  -Marker (Join-Path $work 'm0.txt') -ResultFile ''
+  -Marker (Join-Path $work 'm0.txt') -ResultFile '' -Spawn 'startprocess'
 $script:blind = $sanity.Windows -eq 0
 if ($script:blind) {
   Write-Host "INCONCLUSIVE: no visible console even for a process given its own console."
@@ -318,6 +352,12 @@ Measure-Shape -Name 'noconsole-parent-bare' `
   -Exe $parentExe -ArgList @((Join-Path $work 'r1.txt'), $node, $hookJs, (Join-Path $work 'm1.txt'), 'stdin') `
   -Redirect $false -Marker (Join-Path $work 'm1.txt') -ResultFile (Join-Path $work 'r1.txt') | Out-Null
 
+Measure-Shape -Name 'wsh-parent-bare' `
+  -What 'console-LESS parent (via WSH) spawns node with redirected stdio' `
+  -Exe 'wscript.exe' -ArgList @('//nologo', $hiddenRunner, $parentExe,
+    (Join-Path $work 'r2.txt'), $node, $hookJs, (Join-Path $work 'm2b.txt'), 'stdin') `
+  -Redirect $false -Marker (Join-Path $work 'm2b.txt') -ResultFile (Join-Path $work 'r2.txt') | Out-Null
+
 Write-Host "-- phase 2: the candidate fix --"
 $direct = Measure-Shape -Name 'gui-launcher' `
   -What 'HookLauncher.exe from a console-owning parent, stdin payload' `
@@ -329,6 +369,12 @@ $viaParent = Measure-Shape -Name 'noconsole-parent-launcher' `
   -Exe $parentExe -ArgList @((Join-Path $work 'r3.txt'), $launcherExe, $node, $hookJs, (Join-Path $work 'm3.txt'), 'stdin') `
   -Redirect $false -Marker (Join-Path $work 'm3.txt') -ResultFile (Join-Path $work 'r3.txt')
 
+$viaWsh = Measure-Shape -Name 'wsh-parent-launcher' `
+  -What 'the console-LESS shape, but through HookLauncher.exe' `
+  -Exe 'wscript.exe' -ArgList @('//nologo', $hiddenRunner, $parentExe,
+    (Join-Path $work 'r4.txt'), $launcherExe, $node, $hookJs, (Join-Path $work 'm4.txt'), 'stdin') `
+  -Redirect $false -Marker (Join-Path $work 'm4.txt') -ResultFile (Join-Path $work 'r4.txt')
+
 Write-Host "-- summary --"
 $results | Format-Table Shape, Windows, Ran, Exit, TimedOut, Stdout -AutoSize | Out-String | Write-Host
 
@@ -337,7 +383,8 @@ if ($script:blind) {
   exit 3
 }
 
-$flashShape = @($results | Where-Object { $_.Shape -eq 'noconsole-parent-bare' -and $_.Windows -gt 0 })
+$flashShape = @($results | Where-Object {
+  $_.Shape -in @('noconsole-parent-bare','wsh-parent-bare') -and $_.Windows -gt 0 })
 if ($flashShape.Count -eq 0) {
   Write-Host "NOT REPRODUCED in the production shape: a console-less parent spawning node"
   Write-Host "                showed no visible window either, so the flash comes from"
@@ -348,7 +395,7 @@ if ($flashShape.Count -eq 0) {
 Write-Host "REPRODUCED: a console-less parent makes node allocate a visible console."
 
 $failures = New-Object System.Collections.Generic.List[string]
-foreach ($c in @($direct, $viaParent)) {
+foreach ($c in @($direct, $viaParent, $viaWsh)) {
   if ($c.Windows -ne 0)   { $failures.Add("$($c.Shape): still showed $($c.Windows) console window(s)") }
   if (-not $c.Ran)        { $failures.Add("$($c.Shape): hook never ran") }
   if ($c.TimedOut)        { $failures.Add("$($c.Shape): hung and had to be killed") }
