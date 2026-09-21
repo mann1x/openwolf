@@ -1,22 +1,24 @@
-# Validates the Windows hook-command wrapper against the two things it has
-# to be simultaneously: invisible, and still a working hook.
+# Characterise the Windows console flash, then test the wrapper against it.
 #
-# The console flash is real, but "no window appeared" is also what a
-# headless session produces, and what a wrapper that never ran the child
-# produces. So nothing here is asserted without a control that proves the
-# assertion could have failed:
+# Two things were learned on GitHub-hosted windows-latest (run 35571036631,
+# Server 2025, session 2, UserInteractive True) and they shape this script:
 #
-#   * window visibility is asserted only after the BARE form has been seen
-#     to raise a visible console in this very session. If it does not, the
-#     session cannot show one and the run exits INCONCLUSIVE rather than
-#     green — a check that cannot fail is not evidence.
-#   * the wrapped form must ALSO complete the stdin -> stdout round-trip
-#     and propagate its exit code, because Claude Code delivers the hook
-#     payload on stdin and reads the response from stdout. A wrapper that
-#     hides the window by cutting those pipes passes a window test and
-#     breaks every hook.
+#   1. A single spawn shape cannot answer the question. A child spawned with
+#      REDIRECTED handles from a parent that already owns a console attaches
+#      to that console and shows nothing — so "no window appeared" was true
+#      for the unwrapped form too, and proved nothing about the wrapper.
+#   2. The wrapper is not stdio-transparent. WScript.Shell.Run gives the
+#      child a fresh console instead of the parent's pipes, so node blocked
+#      forever on a stdin that never reached EOF: hook never ran, killed at
+#      the cap. Claude Code delivers the payload on stdin and reads the
+#      reply from stdout, so that is every hook hanging to its timeout.
 #
-# Exit codes: 0 pass, 1 fail, 3 inconclusive (harness blind).
+# So: phase 0 proves this session can show a console window at all, phase 1
+# measures which spawn shapes flash, phase 2 judges the wrapper. Every
+# "invisible" claim is made only after something visible was observed in the
+# same session, because a blind harness reports silence as success.
+#
+# Exit: 0 all assertions held, 1 an assertion failed, 3 inconclusive.
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -29,19 +31,16 @@ Add-Type -Namespace Win32 -Name Windows -MemberDefinition @'
   public delegate bool EnumProc(IntPtr h, IntPtr p);
 '@
 
-# Console hosts, by window class: the classic conhost window, and the
-# Windows Terminal host a modern runner may use instead.
-$consoleClasses = @('ConsoleWindowClass', 'CASCADIA_HOSTING_WINDOW_CLASS')
+$script:consoleClasses = @('ConsoleWindowClass', 'CASCADIA_HOSTING_WINDOW_CLASS')
 
-function Get-VisibleConsoleWindows {
+function Get-VisibleConsoles {
   $found = New-Object System.Collections.Generic.List[string]
   $cb = [Win32.Windows+EnumProc] {
     param([IntPtr]$h, [IntPtr]$p)
     if ([Win32.Windows]::IsWindowVisible($h)) {
       $sb = New-Object System.Text.StringBuilder 256
       [void][Win32.Windows]::GetClassName($h, $sb, $sb.Capacity)
-      $cls = $sb.ToString()
-      if ($script:consoleClasses -contains $cls) { $found.Add("$cls#$h") }
+      if ($script:consoleClasses -contains $sb.ToString()) { $found.Add($sb.ToString() + '#' + $h) }
     }
     return $true
   }
@@ -49,149 +48,214 @@ function Get-VisibleConsoleWindows {
   return $found
 }
 
-function Invoke-Probe {
+# --------------------------------------------------------------- fixture
+
+$tmpBase = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+$work = Join-Path $tmpBase ("cflash-" + [guid]::NewGuid().ToString('n'))
+New-Item -ItemType Directory -Path $work -Force | Out-Null
+$hookJs = Join-Path $work 'hook.js'
+$node   = (Get-Command node).Source
+
+# Stands in for a .wolf hook. argv[2] = marker path, argv[3] = 'stdin' to
+# wait for the payload (what Claude Code sends) or 'nostdin' for the shapes
+# that have no pipe to write on. Lives ~700ms so a flash can be sampled,
+# and exits 7 so propagation is observable.
+@'
+const fs = require("fs");
+const marker = process.argv[2];
+const mode = process.argv[3] || "stdin";
+function finish(raw) {
+  let echoed = "NO_STDIN";
+  if (mode === "stdin") {
+    try { echoed = JSON.parse(raw).marker || "NO_MARKER"; } catch (e) { echoed = "BAD_JSON"; }
+  }
+  fs.writeFileSync(marker, "ran:" + echoed + "\n");
+  process.stdout.write("ECHO:" + echoed + "\n");
+  setTimeout(() => process.exit(7), 700);
+}
+if (mode === "stdin") {
+  let raw = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (d) => { raw += d; });
+  process.stdin.on("end", () => finish(raw));
+} else {
+  finish("");
+}
+'@ | Set-Content -Path $hookJs -Encoding ASCII
+
+$vbsWrapper = Join-Path (Split-Path -Parent $PSScriptRoot) 'assets\hook-runner.vbs'
+if (-not (Test-Path $vbsWrapper)) {
+  Write-Host "FAIL: assets/hook-runner.vbs not found at $vbsWrapper"; exit 1
+}
+
+# Same launcher as the wrapper but SW_SHOWNORMAL instead of SW_HIDE. This is
+# the control for the wrapper's own code path: if style 1 shows a console and
+# style 0 does not, hiding demonstrably works — with no other difference.
+$vbsShown = Join-Path $work 'shown-runner.vbs'
+@'
+Dim cmd, i
+cmd = ""
+For i = 0 To WScript.Arguments.Count - 1
+  If i > 0 Then cmd = cmd & " "
+  cmd = cmd & """" & WScript.Arguments(i) & """"
+Next
+Dim sh
+Set sh = CreateObject("WScript.Shell")
+WScript.Quit(sh.Run(cmd, 1, True))
+'@ | Set-Content -Path $vbsShown -Encoding ASCII
+
+$payload = '{"marker":"PAYLOAD_OK"}'
+$results = New-Object System.Collections.Generic.List[object]
+
+function Invoke-Shape {
   param(
-    [string]$Label,
+    [string]$Name,
+    [string]$Description,
+    [ValidateSet('redirected','startprocess')] [string]$Mode,
     [string]$Exe,
-    [string]$Arguments,
-    [string]$StdinPayload,
-    [string]$MarkerPath
+    [string[]]$Args,
+    [bool]$SendStdin
   )
+  $marker = Join-Path $work ("marker-" + $Name + ".txt")
+  $baseline = Get-VisibleConsoles
+  $seen = New-Object System.Collections.Generic.HashSet[string]
+  $stdout = ''
+  $exit = $null
+  $timedOut = $false
 
-  if (Test-Path $MarkerPath) { Remove-Item $MarkerPath -Force }
-  $baseline = Get-VisibleConsoleWindows
+  if ($Mode -eq 'redirected') {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Exe
+    $psi.Arguments = ($Args | ForEach-Object { '"' + $_ + '"' }) -join ' '
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $false        # never mask the defect under test
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    if ($SendStdin) { $proc.StandardInput.Write($payload) }
+    $proc.StandardInput.Close()
+  } else {
+    # A new console by default: this is the shape that MUST show a window.
+    $proc = Start-Process -FilePath $Exe -ArgumentList $Args -PassThru
+  }
 
+  $deadline = (Get-Date).AddSeconds(20)
+  while (-not $proc.HasExited -and (Get-Date) -lt $deadline) {
+    foreach ($w in Get-VisibleConsoles) { if (-not $baseline.Contains($w)) { [void]$seen.Add($w) } }
+    Start-Sleep -Milliseconds 15
+  }
+  $timedOut = -not $proc.HasExited
+  if ($timedOut) { try { $proc.Kill() } catch {} }
+  [void]$proc.WaitForExit(5000)
+  if ($Mode -eq 'redirected') { $stdout = $proc.StandardOutput.ReadToEnd() }
+  try { $exit = $proc.ExitCode } catch { $exit = $null }
+
+  $r = [pscustomobject]@{
+    Shape    = $Name
+    What     = $Description
+    Windows  = $seen.Count
+    Ran      = (Test-Path $marker)
+    Stdout   = ($stdout -replace '\s+$','')
+    Exit     = $exit
+    TimedOut = $timedOut
+  }
+  $script:results.Add($r)
+  return $r
+}
+
+Write-Host "session   : id=$((Get-Process -Id $PID).SessionId) interactive=$([Environment]::UserInteractive) user=$env:USERNAME"
+Write-Host "os        : $((Get-CimInstance Win32_OperatingSystem).Caption)"
+Write-Host "workdir   : $work"
+Write-Host ""
+
+# ---- phase 0: can this session show a console window at all? ------------
+Write-Host "-- phase 0: harness sanity (a new console MUST be visible) --"
+$sanity = Invoke-Shape -Name 'new-console' -Description 'Start-Process node (its own console)' `
+  -Mode 'startprocess' -Exe $node -Args @($hookJs, (Join-Path $work 'marker-new-console.txt'), 'nostdin') -SendStdin $false
+$sanity | Format-List | Out-String | Write-Host
+
+if ($sanity.Windows -eq 0) {
+  Write-Host "INCONCLUSIVE: even a process given its own console showed no visible window."
+  Write-Host "              This session cannot display one (service/Session 0, or no"
+  Write-Host "              desktop attached), so no invisibility claim made here would"
+  Write-Host "              mean anything. Re-run from an interactive desktop session."
+  exit 3
+}
+Write-Host ("harness can see console windows ({0} observed). Proceeding." -f $sanity.Windows)
+Write-Host ""
+
+# ---- phase 1: which spawn shapes actually flash? -----------------------
+Write-Host "-- phase 1: characterise the spawn shapes --"
+
+Invoke-Shape -Name 'redirected' -Description 'node, redirected stdio, parent owns a console (CI shape)' `
+  -Mode 'redirected' -Exe $node -Args @($hookJs, (Join-Path $work 'marker-redirected.txt'), 'stdin') -SendStdin $true |
+  Format-List | Out-String | Write-Host
+
+$bash = Get-Command bash -ErrorAction SilentlyContinue
+if ($bash) {
+  # Claude Code runs hook commands through bash on every platform, so this
+  # is the shape closest to production.
+  $cmdLine = 'node "{0}" "{1}" stdin' -f ($hookJs -replace '\\','/'), (($work -replace '\\','/') + '/marker-bash.txt')
   $psi = New-Object System.Diagnostics.ProcessStartInfo
-  $psi.FileName = $Exe
-  $psi.Arguments = $Arguments
-  $psi.UseShellExecute = $false          # exactly how Claude Code spawns it
+  $psi.FileName = $bash.Source
+  $psi.Arguments = '-c "' + ($cmdLine -replace '"','\"') + '"'
+  $psi.UseShellExecute = $false
   $psi.RedirectStandardInput = $true
   $psi.RedirectStandardOutput = $true
   $psi.RedirectStandardError = $true
-  $psi.CreateNoWindow = $false           # do NOT mask the defect under test
-
-  $proc = New-Object System.Diagnostics.Process
-  $proc.StartInfo = $psi
-  $stdout = New-Object System.Text.StringBuilder
-  $stderr = New-Object System.Text.StringBuilder
-  $onOut = Register-ObjectEvent $proc OutputDataReceived -Action {
-    if ($EventArgs.Data) { [void]$Event.MessageData.Append($EventArgs.Data) }
-  } -MessageData $stdout
-  $onErr = Register-ObjectEvent $proc ErrorDataReceived -Action {
-    if ($EventArgs.Data) { [void]$Event.MessageData.Append($EventArgs.Data) }
-  } -MessageData $stderr
-
-  [void]$proc.Start()
-  $proc.BeginOutputReadLine()
-  $proc.BeginErrorReadLine()
-  $proc.StandardInput.Write($StdinPayload)
-  $proc.StandardInput.Close()
-
-  # Sample while it runs. The flash is brief by definition, so the sampler
-  # has to be tighter than the thing it is looking for.
+  $baseline = Get-VisibleConsoles
   $seen = New-Object System.Collections.Generic.HashSet[string]
-  $deadline = (Get-Date).AddSeconds(30)
+  $proc = [System.Diagnostics.Process]::Start($psi)
+  $proc.StandardInput.Write($payload); $proc.StandardInput.Close()
+  $deadline = (Get-Date).AddSeconds(20)
   while (-not $proc.HasExited -and (Get-Date) -lt $deadline) {
-    foreach ($w in Get-VisibleConsoleWindows) {
-      if (-not $baseline.Contains($w)) { [void]$seen.Add($w) }
-    }
-    Start-Sleep -Milliseconds 20
+    foreach ($w in Get-VisibleConsoles) { if (-not $baseline.Contains($w)) { [void]$seen.Add($w) } }
+    Start-Sleep -Milliseconds 15
   }
-  $timedOut = -not $proc.HasExited
-  if ($timedOut) { $proc.Kill() }
   [void]$proc.WaitForExit(5000)
-  Start-Sleep -Milliseconds 200            # let the async readers drain
-  Unregister-Event -SourceIdentifier $onOut.Name
-  Unregister-Event -SourceIdentifier $onErr.Name
-
-  return [pscustomobject]@{
-    Label      = $Label
-    Exit       = $proc.ExitCode
-    Stdout     = $stdout.ToString()
-    Stderr     = $stderr.ToString()
-    NewConsoles= @($seen)
-    Ran        = (Test-Path $MarkerPath)
-    TimedOut   = $timedOut
-  }
+  $r = [pscustomobject]@{
+    Shape='bash-c'; What='bash -c node ... (Claude Code hook shape)'; Windows=$seen.Count;
+    Ran=(Test-Path (Join-Path $work 'marker-bash.txt')); Stdout=($proc.StandardOutput.ReadToEnd() -replace '\s+$','');
+    Exit=$proc.ExitCode; TimedOut=$false }
+  $script:results.Add($r); $r | Format-List | Out-String | Write-Host
+} else {
+  Write-Host "bash not on PATH — skipping the Claude Code hook shape."
 }
 
-# ---------------------------------------------------------------- fixture
+Invoke-Shape -Name 'vbs-shown' -Description 'wscript + identical VBS but SW_SHOWNORMAL (wrapper control)' `
+  -Mode 'redirected' -Exe 'wscript.exe' `
+  -Args @('//nologo', $vbsShown, $node, $hookJs, (Join-Path $work 'marker-vbs-shown.txt'), 'nostdin') -SendStdin $false |
+  Format-List | Out-String | Write-Host
 
-$work = Join-Path $env:RUNNER_TEMP ("console-flash-" + [guid]::NewGuid().ToString('n'))
-New-Item -ItemType Directory -Path $work -Force | Out-Null
-$marker = Join-Path $work 'ran.txt'
-$hookJs = Join-Path $work 'hook.js'
-
-# Stands in for a .wolf hook: reads the payload from stdin, answers on
-# stdout, records that it ran, and exits non-zero so propagation is visible.
-@'
-const fs = require("fs");
-let raw = "";
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (d) => { raw += d; });
-process.stdin.on("end", () => {
-  fs.writeFileSync(process.argv[2], "ran\n");
-  let echoed = "NO_STDIN";
-  try { echoed = JSON.parse(raw).marker || "NO_MARKER"; } catch (e) { echoed = "BAD_JSON"; }
-  process.stdout.write("ECHO:" + echoed + "\n");
-  setTimeout(() => process.exit(7), 400);   // stay alive long enough to be seen
-});
-'@ | Set-Content -Path $hookJs -Encoding ASCII
-
-$vbs = Join-Path (Split-Path -Parent $PSScriptRoot) 'assets\hook-runner.vbs'
-if (-not (Test-Path $vbs)) { Write-Host "FAIL: hook-runner.vbs not found at $vbs"; exit 1 }
-
-$payload = '{"marker":"PAYLOAD_OK"}'
-$node = (Get-Command node).Source
-
-Write-Host "== control: bare node (the form that flashes) =="
-$bare = Invoke-Probe -Label 'bare' -Exe $node `
-  -Arguments ('"{0}" "{1}"' -f $hookJs, $marker) -StdinPayload $payload -MarkerPath $marker
-$bare | Format-List | Out-String | Write-Host
-
-Write-Host "== subject: wscript + hook-runner.vbs =="
-$wrapped = Invoke-Probe -Label 'wrapped' -Exe 'wscript.exe' `
-  -Arguments ('//nologo "{0}" "{1}" "{2}" "{3}"' -f $vbs, $node, $hookJs, $marker) `
-  -StdinPayload $payload -MarkerPath $marker
+# ---- phase 2: the wrapper itself ---------------------------------------
+Write-Host "-- phase 2: the wrapper under test --"
+$wrapped = Invoke-Shape -Name 'vbs-hidden' -Description 'wscript + assets/hook-runner.vbs (SW_HIDE), stdin payload' `
+  -Mode 'redirected' -Exe 'wscript.exe' `
+  -Args @('//nologo', $vbsWrapper, $node, $hookJs, (Join-Path $work 'marker-vbs-hidden.txt'), 'stdin') -SendStdin $true
 $wrapped | Format-List | Out-String | Write-Host
 
-# ---------------------------------------------------------------- verdict
+# ---- verdict ------------------------------------------------------------
+Write-Host "-- summary --"
+$results | Format-Table Shape, Windows, Ran, Exit, TimedOut, Stdout -AutoSize | Out-String | Write-Host
+
+$flashing = @($results | Where-Object { $_.Shape -ne 'new-console' -and $_.Windows -gt 0 })
+if ($flashing.Count -eq 0) {
+  Write-Host "NOT REPRODUCED: no spawn shape other than an explicitly-own-console process"
+  Write-Host "                showed a visible window. The flash does not occur here, so"
+  Write-Host "                there is nothing for a wrapper to fix on this host."
+  exit 3
+}
+Write-Host ("REPRODUCED: {0} shape(s) flash — {1}" -f $flashing.Count, (($flashing | ForEach-Object { $_.Shape }) -join ', '))
 
 $failures = New-Object System.Collections.Generic.List[string]
-
-if (-not $bare.Ran) {
-  Write-Host "INCONCLUSIVE: the control hook did not run at all; the fixture is broken."
-  exit 3
-}
-if ($bare.Stdout -notmatch 'ECHO:PAYLOAD_OK') {
-  Write-Host "INCONCLUSIVE: the control did not complete the stdin->stdout round-trip, so"
-  Write-Host "              this harness cannot tell a broken pipe from a working one."
-  exit 3
-}
-if ($bare.NewConsoles.Count -eq 0) {
-  Write-Host "INCONCLUSIVE: no visible console window appeared even for the BARE form."
-  Write-Host "              Either this session cannot show one (headless/Session 0) or"
-  Write-Host "              the flash does not reproduce here. Asserting the wrapper is"
-  Write-Host "              invisible would be asserting nothing."
-  exit 3
-}
-
-Write-Host ("control raised {0} visible console window(s) — the harness can see the defect." -f $bare.NewConsoles.Count)
-
-if ($wrapped.NewConsoles.Count -ne 0) {
-  $failures.Add(("wrapped form still showed {0} visible console window(s): {1}" -f
-    $wrapped.NewConsoles.Count, ($wrapped.NewConsoles -join ', ')))
-}
-if (-not $wrapped.Ran) {
-  $failures.Add("wrapped form never ran the hook (no marker file) — it hid a window by doing nothing")
-}
+if ($wrapped.Windows -ne 0) { $failures.Add("wrapper still showed $($wrapped.Windows) console window(s)") }
+if (-not $wrapped.Ran)      { $failures.Add("wrapper never ran the hook — it hid a window by doing nothing") }
+if ($wrapped.TimedOut)      { $failures.Add("wrapper hung and had to be killed (stdin never reached the child)") }
 if ($wrapped.Stdout -notmatch 'ECHO:PAYLOAD_OK') {
-  $failures.Add(("wrapped form broke the stdin->stdout round-trip; Claude Code would read " +
-    "nothing back. stdout was: '{0}'" -f $wrapped.Stdout.Trim()))
+  $failures.Add("wrapper broke the stdin->stdout round-trip; Claude Code would read nothing back (stdout: '$($wrapped.Stdout)')")
 }
-if ($wrapped.Exit -ne 7) {
-  $failures.Add(("wrapped form did not propagate the hook's exit code: expected 7, got {0}" -f $wrapped.Exit))
-}
+if ($wrapped.Exit -ne 7)    { $failures.Add("wrapper did not propagate the exit code: expected 7, got $($wrapped.Exit)") }
 
 if ($failures.Count -gt 0) {
   Write-Host ""
@@ -199,7 +263,6 @@ if ($failures.Count -gt 0) {
   foreach ($f in $failures) { Write-Host "  * $f" }
   exit 1
 }
-
 Write-Host ""
-Write-Host "PASS — no visible console, hook ran, stdin/stdout round-tripped, exit code propagated."
+Write-Host "PASS — flash reproduced, wrapper invisible, hook ran, stdio round-tripped, exit propagated."
 exit 0
