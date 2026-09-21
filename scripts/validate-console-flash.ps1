@@ -20,6 +20,14 @@
 #
 # Exit: 0 all assertions held, 1 an assertion failed, 3 inconclusive.
 
+[CmdletBinding()]
+param(
+  # Continue past the phase 0 guard in a session that cannot show windows.
+  # For shaking the harness out over SSH only: every window count downstream
+  # is then meaningless, and the script says so and refuses to pass.
+  [switch]$AllowBlindSession
+)
+
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
@@ -113,7 +121,11 @@ function Invoke-Shape {
     [string]$Description,
     [ValidateSet('redirected','startprocess')] [string]$Mode,
     [string]$Exe,
-    [string[]]$Args,
+    # NOT $Args: that collides with PowerShell's automatic $args, which is
+    # empty in an advanced function called with named parameters. The
+    # collision is silent — Start-Process simply received nothing and node
+    # opened a REPL that never exited, measured on pandorum 2026-09-21.
+    [string[]]$ArgList,
     [bool]$SendStdin
   )
   $marker = Join-Path $work ("marker-" + $Name + ".txt")
@@ -126,7 +138,10 @@ function Invoke-Shape {
   if ($Mode -eq 'redirected') {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $Exe
-    $psi.Arguments = ($Args | ForEach-Object { '"' + $_ + '"' }) -join ' '
+    # Quote paths, but never a switch: wscript rejects a quoted //nologo.
+    $psi.Arguments = ($ArgList | ForEach-Object {
+      if ($_ -match '^(//|[-/])') { $_ } else { '"' + $_ + '"' }
+    }) -join ' '
     $psi.UseShellExecute = $false
     $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
@@ -137,7 +152,7 @@ function Invoke-Shape {
     $proc.StandardInput.Close()
   } else {
     # A new console by default: this is the shape that MUST show a window.
-    $proc = Start-Process -FilePath $Exe -ArgumentList $Args -PassThru
+    $proc = Start-Process -FilePath $Exe -ArgumentList $ArgList -PassThru
   }
 
   $deadline = (Get-Date).AddSeconds(20)
@@ -172,7 +187,7 @@ Write-Host ""
 # ---- phase 0: can this session show a console window at all? ------------
 Write-Host "-- phase 0: harness sanity (a new console MUST be visible) --"
 $sanity = Invoke-Shape -Name 'new-console' -Description 'Start-Process node (its own console)' `
-  -Mode 'startprocess' -Exe $node -Args @($hookJs, (Join-Path $work 'marker-new-console.txt'), 'nostdin') -SendStdin $false
+  -Mode 'startprocess' -Exe $node -ArgList @($hookJs, (Join-Path $work 'marker-new-console.txt'), 'nostdin') -SendStdin $false
 $sanity | Format-List | Out-String | Write-Host
 
 if (-not $sanity.Ran) {
@@ -181,28 +196,35 @@ if (-not $sanity.Ran) {
   # pandorum, where Start-Process in session 0 never produced a running
   # child at all — reporting that as "no window appeared" would have
   # pointed the next reader at the wrong half of the harness.
-  Write-Host "INCONCLUSIVE: the phase 0 fixture never ran (marker absent" +
-             $(if ($sanity.TimedOut) { ", and it had to be killed at the cap" } else { "" }) + ")."
+  $why = if ($sanity.TimedOut) { "marker absent, and it had to be killed at the cap" }
+         else { "marker absent" }
+  Write-Host "INCONCLUSIVE: the phase 0 fixture never ran ($why)."
   Write-Host "              Nothing was measured. This is a broken fixture or a session"
   Write-Host "              that cannot start a child with its own console — not evidence"
   Write-Host "              about window visibility either way."
   exit 3
 }
-if ($sanity.Windows -eq 0) {
+$script:blind = $sanity.Windows -eq 0
+if ($script:blind) {
   Write-Host "INCONCLUSIVE: a process given its own console ran, but showed no visible window."
   Write-Host "              This session cannot display one (service/Session 0, or no"
   Write-Host "              desktop attached), so no invisibility claim made here would"
   Write-Host "              mean anything. Re-run from an interactive desktop session."
-  exit 3
+  if (-not $AllowBlindSession) { exit 3 }
+  Write-Host ""
+  Write-Host "-AllowBlindSession given: continuing to exercise the fixtures. Every window"
+  Write-Host "count below is NOT evidence; this run cannot pass."
 }
-Write-Host ("harness can see console windows ({0} observed). Proceeding." -f $sanity.Windows)
+if (-not $script:blind) {
+  Write-Host ("harness can see console windows ({0} observed). Proceeding." -f $sanity.Windows)
+}
 Write-Host ""
 
 # ---- phase 1: which spawn shapes actually flash? -----------------------
 Write-Host "-- phase 1: characterise the spawn shapes --"
 
 Invoke-Shape -Name 'redirected' -Description 'node, redirected stdio, parent owns a console (CI shape)' `
-  -Mode 'redirected' -Exe $node -Args @($hookJs, (Join-Path $work 'marker-redirected.txt'), 'stdin') -SendStdin $true |
+  -Mode 'redirected' -Exe $node -ArgList @($hookJs, (Join-Path $work 'marker-redirected.txt'), 'stdin') -SendStdin $true |
   Format-List | Out-String | Write-Host
 
 # `bash` on PATH is often C:\Windows\System32\bash.exe — the WSL launcher.
@@ -255,20 +277,25 @@ if ($bash) {
 
 Invoke-Shape -Name 'vbs-shown' -Description 'wscript + identical VBS but SW_SHOWNORMAL (wrapper control)' `
   -Mode 'redirected' -Exe 'wscript.exe' `
-  -Args @('//nologo', $vbsShown, $node, $hookJs, (Join-Path $work 'marker-vbs-shown.txt'), 'nostdin') -SendStdin $false |
+  -ArgList @('//nologo', $vbsShown, $node, $hookJs, (Join-Path $work 'marker-vbs-shown.txt'), 'nostdin') -SendStdin $false |
   Format-List | Out-String | Write-Host
 
 # ---- phase 2: the wrapper itself ---------------------------------------
 Write-Host "-- phase 2: the wrapper under test --"
 $wrapped = Invoke-Shape -Name 'vbs-hidden' -Description 'wscript + assets/hook-runner.vbs (SW_HIDE), stdin payload' `
   -Mode 'redirected' -Exe 'wscript.exe' `
-  -Args @('//nologo', $vbsWrapper, $node, $hookJs, (Join-Path $work 'marker-vbs-hidden.txt'), 'stdin') -SendStdin $true
+  -ArgList @('//nologo', $vbsWrapper, $node, $hookJs, (Join-Path $work 'marker-vbs-hidden.txt'), 'stdin') -SendStdin $true
 $wrapped | Format-List | Out-String | Write-Host
 
 # ---- verdict ------------------------------------------------------------
 Write-Host "-- summary --"
 $results | Format-Table Shape, Windows, Ran, Exit, TimedOut, Stdout -AutoSize | Out-String | Write-Host
 
+if ($script:blind) {
+  Write-Host "INCONCLUSIVE: harness-shakeout run in a blind session. Fixture behaviour above"
+  Write-Host "              is real (ran / stdout / exit); every window count is not."
+  exit 3
+}
 $flashing = @($results | Where-Object { $_.Shape -ne 'new-console' -and $_.Windows -gt 0 })
 if ($flashing.Count -eq 0) {
   Write-Host "NOT REPRODUCED: no spawn shape other than an explicitly-own-console process"
