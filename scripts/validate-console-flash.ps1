@@ -175,8 +175,21 @@ $sanity = Invoke-Shape -Name 'new-console' -Description 'Start-Process node (its
   -Mode 'startprocess' -Exe $node -Args @($hookJs, (Join-Path $work 'marker-new-console.txt'), 'nostdin') -SendStdin $false
 $sanity | Format-List | Out-String | Write-Host
 
+if (-not $sanity.Ran) {
+  # Distinct from "no window": the fixture itself never completed, so the
+  # window observation is not the thing that failed. Seen over SSH on
+  # pandorum, where Start-Process in session 0 never produced a running
+  # child at all — reporting that as "no window appeared" would have
+  # pointed the next reader at the wrong half of the harness.
+  Write-Host "INCONCLUSIVE: the phase 0 fixture never ran (marker absent" +
+             $(if ($sanity.TimedOut) { ", and it had to be killed at the cap" } else { "" }) + ")."
+  Write-Host "              Nothing was measured. This is a broken fixture or a session"
+  Write-Host "              that cannot start a child with its own console — not evidence"
+  Write-Host "              about window visibility either way."
+  exit 3
+}
 if ($sanity.Windows -eq 0) {
-  Write-Host "INCONCLUSIVE: even a process given its own console showed no visible window."
+  Write-Host "INCONCLUSIVE: a process given its own console ran, but showed no visible window."
   Write-Host "              This session cannot display one (service/Session 0, or no"
   Write-Host "              desktop attached), so no invisibility claim made here would"
   Write-Host "              mean anything. Re-run from an interactive desktop session."
