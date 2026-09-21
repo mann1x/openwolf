@@ -205,13 +205,30 @@ Invoke-Shape -Name 'redirected' -Description 'node, redirected stdio, parent own
   -Mode 'redirected' -Exe $node -Args @($hookJs, (Join-Path $work 'marker-redirected.txt'), 'stdin') -SendStdin $true |
   Format-List | Out-String | Write-Host
 
-$bash = Get-Command bash -ErrorAction SilentlyContinue
+# `bash` on PATH is often C:\Windows\System32\bash.exe — the WSL launcher.
+# That runs the hook inside a Linux distro where these Windows paths do not
+# exist, so it would report "did not run" and read as "this shape does not
+# flash" when the shape was never tested. Claude Code uses an msys/Git bash,
+# so prefer that and say which one was used.
+$bashCandidates = @(
+  'C:\msys64\usr\bin\bash.exe',
+  'C:\Program Files\Git\bin\bash.exe',
+  'C:\Program Files\Git\usr\bin\bash.exe'
+) + @(Get-Command bash -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
+$bash = $null
+foreach ($c in $bashCandidates) {
+  if ($c -and (Test-Path $c) -and ($c -notlike '*\System32\bash.exe') -and
+      ($c -notlike '*\WindowsApps\bash.exe')) {
+    $bash = Get-Item $c; break
+  }
+}
 if ($bash) {
+  Write-Host ("using bash: {0}" -f $bash.FullName)
   # Claude Code runs hook commands through bash on every platform, so this
   # is the shape closest to production.
   $cmdLine = 'node "{0}" "{1}" stdin' -f ($hookJs -replace '\\','/'), (($work -replace '\\','/') + '/marker-bash.txt')
   $psi = New-Object System.Diagnostics.ProcessStartInfo
-  $psi.FileName = $bash.Source
+  $psi.FileName = $bash.FullName
   $psi.Arguments = '-c "' + ($cmdLine -replace '"','\"') + '"'
   $psi.UseShellExecute = $false
   $psi.RedirectStandardInput = $true
@@ -233,7 +250,7 @@ if ($bash) {
     Exit=$proc.ExitCode; TimedOut=$false }
   $script:results.Add($r); $r | Format-List | Out-String | Write-Host
 } else {
-  Write-Host "bash not on PATH — skipping the Claude Code hook shape."
+  Write-Host "no msys/Git bash found (WSL's System32 bash does not count) — skipping the Claude Code hook shape."
 }
 
 Invoke-Shape -Name 'vbs-shown' -Description 'wscript + identical VBS but SW_SHOWNORMAL (wrapper control)' `
