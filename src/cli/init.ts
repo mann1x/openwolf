@@ -1,4 +1,5 @@
 import {withVisibilityStatusline} from './visibility-settings.js';
+import { ensureHookLauncher } from '../utils/hook-command.js';
 import { waitDaemonReady } from "../utils/daemon-ready.js";
 import { claudePaths } from "./claude-paths.js";
 import * as os from "node:os";
@@ -151,6 +152,11 @@ export async function initCommand(options?: { agent?: string[] }): Promise<void>
 
   const settingsPath = claudePaths(projectRoot).settings;
     ensureDir(path.dirname(settingsPath));
+  // Build the Windows hook launcher before composing the commands, so the
+  // manifest can reference it. Best effort by design: it returns null on any
+  // failure and the commands fall back to the plain node form, which flashes
+  // a console but works. Never fatal — a hook that does not run is worse.
+  ensureHookLauncher({ log: (m) => console.log(m) });
   const hookSettings = buildHookSettings(projectRoot);
   if (fs.existsSync(settingsPath)) {
     const existing = JSON.parse(fs.readFileSync(settingsPath,"utf8"));

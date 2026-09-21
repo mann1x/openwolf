@@ -1,3 +1,5 @@
+import { buildHookCommand } from "../utils/hook-command.js";
+
 // Single source of truth for which hook scripts exist and how they are
 // registered in Claude Code settings. init.ts and update.ts both consume this
 // so the two can never drift (they used to carry hand-mirrored copies).
@@ -19,9 +21,18 @@
 // zsh, cmd.exe and PowerShell, and it survives a CWD change mid-session.
 // Forward slashes are used on every platform: node accepts them on Windows,
 // and they keep the command free of backslash escaping inside JSON.
+//
+// On Windows the command is additionally routed through the hook launcher when
+// one is available. node.exe is a console-subsystem binary, so when whatever
+// spawns the hook has no console of its own, Windows allocates one and it is
+// visible — a flash on every tool call. The launcher suppresses that without
+// touching the hook's stdio; buildHookCommand falls back to this exact bare
+// form when there is no launcher, on Windows or anywhere else.
 const cmd = (projectDir: string, file: string, timeout: number) => ({
   type: "command" as const,
-  command: `node "${projectDir.replace(/\\/g, "/").replace(/\/+$/, "")}/.wolf/hooks/${file}"`,
+  command: buildHookCommand(
+    `${projectDir.replace(/\\/g, "/").replace(/\/+$/, "")}/.wolf/hooks/${file}`
+  ),
   timeout,
 });
 

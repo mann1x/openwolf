@@ -1,4 +1,5 @@
 import {withVisibilityStatusline} from './visibility-settings.js';
+import { ensureHookLauncher } from '../utils/hook-command.js';
 import { claudePaths } from "./claude-paths.js";
 /**
  * openwolf update — Update all registered OpenWolf projects.
@@ -231,6 +232,11 @@ async function updateProject(
     ensureDir(claudeDir);
     const settingsPath = claudePaths(root).settings;
     ensureDir(path.dirname(settingsPath));
+    // Build the Windows hook launcher before composing the commands, so the
+    // manifest can reference it. Best effort by design: it returns null on any
+    // failure and the commands fall back to the plain node form, which flashes
+    // a console but works. Never fatal — a hook that does not run is worse.
+    ensureHookLauncher({ log: (m) => console.log(m) });
     const hookSettings = buildHookSettings(root);
     if (fs.existsSync(settingsPath)) {
       const existing = JSON.parse(fs.readFileSync(settingsPath,"utf8"));
